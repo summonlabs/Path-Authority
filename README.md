@@ -1,7 +1,6 @@
 # Path Authority 1.0.0
 
-Path Authority is the authoritative path-legality runtime of the Distributed Fabric
-Infrastructure / Fabric OS stack. It answers exactly one question:
+Path Authority is the authoritative path-legality runtime for data-center fabric infrastructure. It answers exactly one question:
 
 > Does this exact candidate path remain legally usable under the current
 > authoritative topology, link-state, capability, failure-domain, epoch and policy
