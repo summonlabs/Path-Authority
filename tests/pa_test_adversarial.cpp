@@ -1,7 +1,29 @@
 // Path Authority 1.0.0 - Summon Software Labs.
 // Apache License 2.0. See LICENSE.
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include "fixture.hpp"
 #include "path_authority/path_authority.hpp"
@@ -15,6 +37,118 @@ namespace {
 
 bool rejected_shape(const PathDefinition& path, PathShapeStatus expected) {
   return validate_path_shape(path, Limits::defaults(), false).status == expected;
+}
+
+
+#if defined(_WIN32)
+using raw_socket = SOCKET;
+using raw_length = int;
+constexpr raw_socket kNoRawSocket = INVALID_SOCKET;
+void close_raw(raw_socket handle) { ::closesocket(handle); }
+void finish_raw(raw_socket handle) { ::shutdown(handle, SD_SEND); }
+#else
+using raw_socket = int;
+using raw_length = std::size_t;
+constexpr raw_socket kNoRawSocket = -1;
+void close_raw(raw_socket handle) { ::close(handle); }
+void finish_raw(raw_socket handle) { ::shutdown(handle, SHUT_WR); }
+#endif
+
+// A loopback peer that writes frame bytes exactly as a test lays them out.
+// The coordinator under test has initialised the socket library already.
+class RawPeer {
+ public:
+  explicit RawPeer(std::uint16_t port) {
+    handle_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    connected_ = handle_ != kNoRawSocket &&
+                 ::connect(handle_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+  }
+  ~RawPeer() {
+    if (handle_ != kNoRawSocket) {
+      close_raw(handle_);
+    }
+  }
+  RawPeer(const RawPeer&) = delete;
+  RawPeer& operator=(const RawPeer&) = delete;
+
+  bool connected() const { return connected_; }
+
+  bool send_bytes(const std::vector<std::byte>& bytes, std::size_t begin, std::size_t end) {
+    std::size_t offset = begin;
+    while (offset < end) {
+      const auto sent = ::send(handle_, reinterpret_cast<const char*>(bytes.data() + offset),
+                               static_cast<raw_length>(end - offset), 0);
+      if (sent <= 0) {
+        return false;
+      }
+      offset += static_cast<std::size_t>(sent);
+    }
+    return true;
+  }
+
+  // Ends the request stream; the coordinator then closes the connection.
+  void finish_sending() { finish_raw(handle_); }
+
+  // Every frame the coordinator sends until it closes the connection.
+  std::vector<Frame> read_frames_to_end(const Limits& limits) {
+    std::vector<std::byte> bytes;
+    std::array<char, 4096> chunk{};
+    for (;;) {
+      const auto got = ::recv(handle_, chunk.data(), static_cast<raw_length>(chunk.size()), 0);
+      if (got <= 0) {
+        break;
+      }
+      for (std::size_t index = 0; index < static_cast<std::size_t>(got); ++index) {
+        bytes.push_back(static_cast<std::byte>(chunk[index]));
+      }
+    }
+    std::vector<Frame> frames;
+    std::size_t offset = 0;
+    for (;;) {
+      std::size_t consumed = 0;
+      std::string error;
+      const auto frame = decode_frame(
+          std::span<const std::byte>(bytes.data() + offset, bytes.size() - offset), limits, consumed,
+          error);
+      if (!frame.has_value()) {
+        break;
+      }
+      frames.push_back(*frame);
+      offset += consumed;
+    }
+    return frames;
+  }
+
+ private:
+  raw_socket handle_ = kNoRawSocket;
+  bool connected_ = false;
+};
+
+CoordinatorConfig loopback_coordinator(Fabric& fabric) {
+  CoordinatorConfig config;
+  config.persistence_enabled = false;
+  config.epoch_control = &fabric.evidence.epoch;
+  return config;
+}
+
+std::size_t count_of(const std::vector<Frame>& frames, MessageType type) {
+  std::size_t count = 0;
+  for (const auto& frame : frames) {
+    if (frame.type == type) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::vector<std::byte> heartbeat_bytes(const Limits& limits) {
+  Frame heartbeat;
+  heartbeat.type = MessageType::HEARTBEAT;
+  return encode_frame(heartbeat, limits);
 }
 
 }  // namespace
@@ -299,6 +433,96 @@ PA_TEST(deeply_nested_underlying_chains_are_bounded) {
     chain.push_back(logical);
   }
   PA_CHECK(!chain.empty());
+}
+
+PA_TEST(a_second_coordinator_cannot_take_a_listening_port) {
+  Fabric fabric;
+  PathAuthorityCoordinator first(loopback_coordinator(fabric), fabric.evidence.sources());
+  std::string error;
+  const bool first_started = first.start(error);
+  PA_REQUIRE(first_started);
+  // Two coordinators must never share one listening port: the second start fails.
+  CoordinatorConfig config = loopback_coordinator(fabric);
+  config.port = first.port();
+  PathAuthorityCoordinator second(config, fabric.evidence.sources());
+  PA_CHECK(!second.start(error));
+  second.stop();
+  first.stop();
+}
+
+PA_TEST(back_to_back_frames_are_each_answered) {
+  Fabric fabric;
+  PathAuthorityCoordinator coordinator(loopback_coordinator(fabric), fabric.evidence.sources());
+  std::string error;
+  const bool started = coordinator.start(error);
+  PA_REQUIRE(started);
+  const Limits limits = coordinator.runtime().limits();
+  std::vector<std::byte> bytes = heartbeat_bytes(limits);
+  const std::vector<std::byte> second = heartbeat_bytes(limits);
+  bytes.insert(bytes.end(), second.begin(), second.end());
+  RawPeer peer(coordinator.port());
+  PA_REQUIRE(peer.connected());
+  // Both heartbeats leave in one write, so they reach the coordinator together.
+  const bool sent = peer.send_bytes(bytes, 0, bytes.size());
+  PA_REQUIRE(sent);
+  peer.finish_sending();
+  const std::vector<Frame> answers = peer.read_frames_to_end(limits);
+  PA_CHECK_EQ(count_of(answers, MessageType::HEARTBEAT_ACK), std::size_t{2});
+  coordinator.stop();
+}
+
+PA_TEST(a_frame_interrupted_by_a_pause_is_still_received) {
+  Fabric fabric;
+  PathAuthorityCoordinator coordinator(loopback_coordinator(fabric), fabric.evidence.sources());
+  std::string error;
+  const bool started = coordinator.start(error);
+  PA_REQUIRE(started);
+  const Limits limits = coordinator.runtime().limits();
+  const std::vector<std::byte> bytes = heartbeat_bytes(limits);
+  RawPeer peer(coordinator.port());
+  PA_REQUIRE(peer.connected());
+  // The pause is longer than the coordinator's receive slice, so the frame is
+  // read in two separate calls.
+  const std::size_t half = bytes.size() / 2;
+  const bool first_half_sent = peer.send_bytes(bytes, 0, half);
+  PA_REQUIRE(first_half_sent);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const bool second_half_sent = peer.send_bytes(bytes, half, bytes.size());
+  PA_REQUIRE(second_half_sent);
+  peer.finish_sending();
+  const std::vector<Frame> answers = peer.read_frames_to_end(limits);
+  PA_CHECK_EQ(count_of(answers, MessageType::HEARTBEAT_ACK), std::size_t{1});
+  coordinator.stop();
+}
+
+PA_TEST(a_request_to_a_stopped_coordinator_fails_without_throwing) {
+  Fabric fabric;
+  PathAuthorityCoordinator coordinator(loopback_coordinator(fabric), fabric.evidence.sources());
+  std::string error;
+  const bool started = coordinator.start(error);
+  PA_REQUIRE(started);
+  EvaluatorConfig evaluator_config;
+  evaluator_config.coordinator_port = coordinator.port();
+  evaluator_config.publisher = PublisherId::parse("stopped-coordinator-publisher");
+  evaluator_config.worker_boot = WorkerBootId::parse("stopped-coordinator-boot");
+  evaluator_config.scope = ScopeId::parse("stopped-coordinator-scope");
+  PathAuthorityEvaluator evaluator(evaluator_config, fabric.evidence.sources());
+  const bool connected = evaluator.connect(error);
+  PA_REQUIRE(connected);
+  const bool first_heartbeat = evaluator.heartbeat();
+  PA_REQUIRE(first_heartbeat);
+  coordinator.stop();
+  // The connection is gone: the request reports failure through its result.
+  bool answered = true;
+  bool threw = false;
+  try {
+    answered = evaluator.heartbeat();
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  PA_CHECK(!threw);
+  PA_CHECK(!answered);
+  PA_CHECK(!evaluator.last_error().empty());
 }
 
 PA_TEST_MAIN()

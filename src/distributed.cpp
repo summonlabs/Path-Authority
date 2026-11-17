@@ -109,10 +109,11 @@ bool send_frame(socket_handle handle, const Frame& frame, const Limits& limits, 
 
 enum class ReceiveStatus { FRAME, TIMEOUT, CLOSED, FAILED };
 
-ReceiveStatus receive_frame(socket_handle handle, const Limits& limits, Frame& frame,
-                            std::string& error) {
-  std::vector<std::byte> buffer;
-  buffer.reserve(4096);
+// buffer belongs to the connection and outlives each call: bytes after the
+// returned frame (the next frame) and a partial frame interrupted by a
+// TIMEOUT stay in it for the next call instead of being discarded.
+ReceiveStatus receive_frame(socket_handle handle, const Limits& limits,
+                            std::vector<std::byte>& buffer, Frame& frame, std::string& error) {
   std::array<std::byte, 8192> chunk{};
   for (;;) {
     std::size_t consumed = 0;
@@ -120,6 +121,7 @@ ReceiveStatus receive_frame(socket_handle handle, const Limits& limits, Frame& f
     const auto decoded = decode_frame(buffer, limits, consumed, decode_error);
     if (decoded.has_value()) {
       frame = *decoded;
+      buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(consumed));
       return ReceiveStatus::FRAME;
     }
     if (!decode_error.empty()) {
@@ -187,8 +189,15 @@ bool tcp_listen(const std::string& host, std::uint16_t port, socket_handle& hand
     return false;
   }
   int reuse = 1;
+#if defined(_WIN32)
+  // SO_REUSEADDR on Windows lets a second socket bind a port that is still
+  // listening; exclusive use makes that second bind fail instead.
+  ::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&reuse),
+               sizeof(reuse));
+#else
   ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse),
                sizeof(reuse));
+#endif
   if (::bind(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
     error = "cannot bind " + host + ":" + std::to_string(port) + ": " + socket_error_text();
     close_socket(handle);
@@ -261,6 +270,7 @@ struct PathAuthorityCoordinator::Impl {
     std::uint64_t id = 0;
     std::atomic<bool> finished{false};
     std::set<std::string> workers;
+    std::vector<std::byte> received;
     std::thread thread;
   };
 
@@ -546,7 +556,8 @@ struct PathAuthorityCoordinator::Impl {
       }
       Frame frame;
       std::string error;
-      const ReceiveStatus status = receive_frame(connection->handle, limits(), frame, error);
+      const ReceiveStatus status =
+          receive_frame(connection->handle, limits(), connection->received, frame, error);
       if (status == ReceiveStatus::TIMEOUT) {
         continue;
       }
@@ -906,6 +917,7 @@ struct PathAuthorityEvaluator::Impl {
   EvidenceSources sources;
   std::unique_ptr<PathAuthorityRuntime> runtime;
   socket_handle socket = kInvalidSocket;
+  std::vector<std::byte> received;
   mutable std::mutex mutex;
   bool registered = false;
   CoordinatorEpoch epoch;
@@ -914,8 +926,10 @@ struct PathAuthorityEvaluator::Impl {
 
   const Limits& limits() const { return runtime->limits(); }
 
+  // Called only from exchange(), whose callers already hold mutex: locking it
+  // again here made every failed request throw std::system_error instead of
+  // returning false.
   bool set_error(std::string text) {
-    const std::lock_guard lock(mutex);
     error = std::move(text);
     return false;
   }
@@ -939,6 +953,7 @@ struct PathAuthorityEvaluator::Impl {
       failure = socket_failure;
       return false;
     }
+    received.clear();
     return true;
   }
 
@@ -954,7 +969,7 @@ struct PathAuthorityEvaluator::Impl {
     }
     for (;;) {
       Frame incoming;
-      const ReceiveStatus status = receive_frame(socket, limits(), incoming, failure);
+      const ReceiveStatus status = receive_frame(socket, limits(), received, incoming, failure);
       if (status == ReceiveStatus::TIMEOUT) {
         continue;
       }
@@ -1197,6 +1212,7 @@ struct PathAuthorityEvaluator::Impl {
     send_frame(socket, shutdown, limits(), failure);
     close_socket(socket);
     socket = kInvalidSocket;
+    received.clear();
     registered = false;
   }
 };
